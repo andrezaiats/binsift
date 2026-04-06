@@ -1,7 +1,27 @@
 """Shared data structures for ELF triage analysis."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
+
+
+class ConditionConfidence(Enum):
+    """Confidence level for an exploitability condition assessment."""
+
+    CONFIRMED = "confirmed"
+    INFERRED = "inferred"
+    UNKNOWN = "unknown"
+
+
+class ExploitPrimitive(Enum):
+    """Type of exploit primitive a vulnerability may yield."""
+
+    FLOW_CONTROL = "flow_control"
+    INFO_LEAK = "info_leak"
+    ARBITRARY_WRITE = "arbitrary_write"
+    DOS = "dos"
+    NONE = "none"
 
 
 class ArgSource(Enum):
@@ -68,6 +88,27 @@ class CallSite:
 
 
 @dataclass
+class ExploitCondition:
+    """A single condition relevant to exploitability assessment."""
+
+    name: str
+    satisfied: bool
+    confidence: ConditionConfidence
+    detail: str = ""
+
+
+@dataclass
+class ExploitScenario:
+    """A potential exploit scenario linking conditions to a primitive."""
+
+    primitive: ExploitPrimitive
+    title: str
+    description: str
+    conditions: list[ExploitCondition] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+
+
+@dataclass
 class Finding:
     """A ranked finding combining a dangerous import with its call sites."""
 
@@ -75,6 +116,8 @@ class Finding:
     call_sites: list[CallSite] = field(default_factory=list)
     severity_score: float = 0.0
     exploitability_notes: list[str] = field(default_factory=list)
+    exploit_conditions: list[ExploitCondition] = field(default_factory=list)
+    exploit_primitive: ExploitPrimitive = ExploitPrimitive.NONE
 
 
 @dataclass
@@ -95,3 +138,4 @@ class AnalysisResult:
     findings: list[Finding] = field(default_factory=list)
     functions: list[FunctionBoundary] = field(default_factory=list)
     summary_stats: dict[str, int] = field(default_factory=dict)
+    exploit_scenarios: list[ExploitScenario] = field(default_factory=list)

@@ -7,6 +7,9 @@ from elftriage.types import (
     AnalysisResult,
     ArgumentInfo,
     CallSite,
+    ConditionConfidence,
+    ExploitCondition,
+    ExploitScenario,
     Finding,
     ProtectionInfo,
 )
@@ -58,6 +61,11 @@ def generate_text_report(result: AnalysisResult) -> str:
     else:
         lines.append("No dangerous function imports detected.")
 
+    # Exploit scenarios
+    if result.exploit_scenarios:
+        lines.append("")
+        lines.extend(_format_scenarios(result.exploit_scenarios))
+
     lines.append("=" * 70)
     return "\n".join(lines)
 
@@ -104,6 +112,14 @@ def _format_finding(index: int, finding: Finding) -> list[str]:
         for note in finding.exploitability_notes:
             lines.append(f"        ! {note}")
 
+    # Exploit conditions
+    if finding.exploit_conditions:
+        primitive_label = finding.exploit_primitive.value.upper().replace("_", " ")
+        lines.append(f"      Exploit primitive: {primitive_label}")
+        lines.append("      Conditions:")
+        for cond in finding.exploit_conditions:
+            lines.extend(_format_condition(cond, indent=8))
+
     for site in finding.call_sites:
         header = f"      --- Call at 0x{site.address:x}"
         if site.containing_function:
@@ -133,6 +149,128 @@ def _yes_no(value: bool) -> str:
     return "Yes" if value else "No"
 
 
+def _format_condition(cond: ExploitCondition, indent: int = 4) -> list[str]:
+    """Format a single exploit condition as text lines.
+
+    Args:
+        cond: The exploit condition to format.
+        indent: Number of leading spaces.
+
+    Returns:
+        List of formatted text lines.
+    """
+    prefix = " " * indent
+    confidence_tag = f"[{cond.confidence.value.upper()}]"
+    symbol = "\u2713" if cond.satisfied else "\u2717"
+    detail_str = f" ({cond.detail})" if cond.detail else ""
+    return [f"{prefix}{confidence_tag:12s} {symbol} {cond.name}{detail_str}"]
+
+
+def _format_scenarios(scenarios: list[ExploitScenario]) -> list[str]:
+    """Format exploit scenarios section as text lines.
+
+    Scenarios are ordered by number of satisfied conditions (most first).
+
+    Args:
+        scenarios: List of exploit scenarios to format.
+
+    Returns:
+        List of formatted text lines.
+    """
+    sorted_scenarios = sorted(
+        scenarios,
+        key=lambda s: sum(1 for c in s.conditions if c.satisfied),
+        reverse=True,
+    )
+
+    lines: list[str] = []
+    lines.append("-" * 42)
+    lines.append("Exploit Scenarios (by ease of exploitation)")
+    lines.append("-" * 42)
+
+    for scenario in sorted_scenarios:
+        primitive_label = scenario.primitive.value.upper().replace("_", " ")
+        lines.append("")
+        lines.append(f"  [{primitive_label}] {scenario.title}")
+        lines.append(f"  {scenario.description}")
+        lines.append("")
+
+        if scenario.conditions:
+            lines.append("  Conditions:")
+            for cond in scenario.conditions:
+                lines.extend(_format_condition(cond, indent=4))
+            lines.append("")
+
+            satisfied = sum(1 for c in scenario.conditions if c.satisfied)
+            total = len(scenario.conditions)
+            unknown = sum(
+                1
+                for c in scenario.conditions
+                if c.confidence == ConditionConfidence.UNKNOWN
+            )
+            lines.append(
+                f"  Satisfied: {satisfied}/{total} confirmed, "
+                f"{unknown}/{total} unknown"
+            )
+            lines.append("")
+
+        if scenario.findings:
+            lines.append("  Related findings:")
+            for finding in scenario.findings:
+                sites = len(finding.call_sites)
+                site_word = "call site" if sites == 1 else "call sites"
+                lines.append(
+                    f"    - {finding.dangerous_import.name} "
+                    f"(severity: {finding.severity_score}) "
+                    f"\u2014 {sites} {site_word}"
+                )
+            lines.append("")
+
+        lines.append("  ---")
+
+    return lines
+
+
+def _condition_to_dict(cond: ExploitCondition) -> dict[str, Any]:
+    """Convert an ExploitCondition to a JSON-serializable dict.
+
+    Args:
+        cond: The exploit condition to convert.
+
+    Returns:
+        Dictionary representation of the condition.
+    """
+    data: dict[str, Any] = {
+        "name": cond.name,
+        "satisfied": cond.satisfied,
+        "confidence": cond.confidence.value,
+    }
+    if cond.detail:
+        data["detail"] = cond.detail
+    return data
+
+
+def _scenario_to_dict(scenario: ExploitScenario) -> dict[str, Any]:
+    """Convert an ExploitScenario to a JSON-serializable dict.
+
+    Args:
+        scenario: The exploit scenario to convert.
+
+    Returns:
+        Dictionary representation of the scenario.
+    """
+    satisfied = sum(1 for c in scenario.conditions if c.satisfied)
+    return {
+        "primitive": scenario.primitive.value,
+        "title": scenario.title,
+        "description": scenario.description,
+        "conditions": [_condition_to_dict(c) for c in scenario.conditions],
+        "satisfied_count": satisfied,
+        "total_conditions": len(scenario.conditions),
+        "related_findings": [f.dangerous_import.name for f in scenario.findings],
+    }
+
+
 def _result_to_dict(result: AnalysisResult) -> dict[str, Any]:
     """Convert an AnalysisResult to a JSON-serializable dict."""
     data: dict[str, Any] = {
@@ -149,6 +287,10 @@ def _result_to_dict(result: AnalysisResult) -> dict[str, Any]:
     }
     if result.functions:
         data["functions_detected"] = len(result.functions)
+    if result.exploit_scenarios:
+        data["exploit_scenarios"] = [
+            _scenario_to_dict(s) for s in result.exploit_scenarios
+        ]
     return data
 
 
@@ -167,6 +309,11 @@ def _finding_to_dict(finding: Finding) -> dict[str, Any]:
         result["got_address"] = f"0x{imp.got_address:x}"
     if finding.exploitability_notes:
         result["exploitability_notes"] = finding.exploitability_notes
+    if finding.exploit_conditions:
+        result["exploit_conditions"] = [
+            _condition_to_dict(c) for c in finding.exploit_conditions
+        ]
+        result["exploit_primitive"] = finding.exploit_primitive.value
     return result
 
 

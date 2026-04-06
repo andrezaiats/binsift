@@ -2,7 +2,7 @@
 
 import argparse
 import sys
-from typing import Optional
+from typing import Optional, Sequence
 
 from elftriage.parser import open_elf
 from elftriage.protections import detect_protections
@@ -10,9 +10,10 @@ from elftriage.imports import resolve_dangerous_imports
 from elftriage.disassembly import disassemble_call_sites
 from elftriage.functions import detect_functions
 from elftriage.arganalysis import analyze_call_arguments
-from elftriage.classifier import classify_findings
+from elftriage.classifier import classify_findings, build_exploit_scenarios
+from elftriage.stackframe import StackFrameLayout, analyze_stack_frame
 from elftriage.report import generate_text_report, generate_json_report
-from elftriage.types import AnalysisResult
+from elftriage.types import AnalysisResult, FunctionBoundary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,7 +81,12 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
         functions = detect_functions(elffile)
         call_sites = disassemble_call_sites(elffile, imports, context_lines, functions)
         call_sites = analyze_call_arguments(elffile, call_sites)
-        findings = classify_findings(imports, call_sites, protections)
+
+        # Build stack frame layouts for functions containing call sites
+        stack_layouts = _build_stack_layouts(elffile, call_sites, functions)
+
+        findings = classify_findings(imports, call_sites, protections, stack_layouts)
+        scenarios = build_exploit_scenarios(findings, protections)
 
         # Build summary stats
         summary: dict[str, int] = {
@@ -101,7 +107,47 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
             findings=findings,
             functions=functions,
             summary_stats=summary,
+            exploit_scenarios=scenarios,
         )
+
+
+def _build_stack_layouts(
+    elffile: object,
+    call_sites: Sequence[object],
+    functions: list[FunctionBoundary],
+) -> dict[str, StackFrameLayout]:
+    """Build stack frame layouts for functions that contain call sites.
+
+    Only analyzes functions that are referenced by at least one call site,
+    avoiding unnecessary disassembly of the entire binary.
+
+    Args:
+        elffile: A parsed ELF file object.
+        call_sites: List of call sites with containing_function set.
+        functions: List of detected function boundaries.
+
+    Returns:
+        Mapping of function name to its reconstructed stack frame layout.
+    """
+    # Collect unique function names referenced by call sites
+    target_names: set[str] = set()
+    for site in call_sites:
+        if hasattr(site, "containing_function") and site.containing_function:
+            target_names.add(site.containing_function)
+
+    if not target_names:
+        return {}
+
+    # Build a lookup from function name to boundary
+    func_by_name: dict[str, FunctionBoundary] = {f.name: f for f in functions}
+
+    layouts: dict[str, StackFrameLayout] = {}
+    for name in target_names:
+        func = func_by_name.get(name)
+        if func is not None:
+            layouts[name] = analyze_stack_frame(elffile, func)  # type: ignore[arg-type]
+
+    return layouts
 
 
 def main(argv: Optional[list[str]] = None) -> None:
