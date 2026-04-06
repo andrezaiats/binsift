@@ -24,6 +24,6 @@ def test_import_fields_populated(bin_ls_elffile: ELFFile) -> None:
 def test_categories_are_valid(bin_ls_elffile: ELFFile) -> None:
     """All import categories should be from the known set."""
     imports = resolve_dangerous_imports(bin_ls_elffile)
-    valid = {"critical", "warning", "mitigated"}
+    valid = {"critical", "warning", "mitigated", "format_string"}
     for imp in imports:
         assert imp.category in valid

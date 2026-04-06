@@ -4,10 +4,12 @@ import argparse
 import sys
 from typing import Optional
 
-from elftriage.parser import parse_elf
+from elftriage.parser import open_elf
 from elftriage.protections import detect_protections
 from elftriage.imports import resolve_dangerous_imports
 from elftriage.disassembly import disassemble_call_sites
+from elftriage.functions import detect_functions
+from elftriage.arganalysis import analyze_call_arguments
 from elftriage.classifier import classify_findings
 from elftriage.report import generate_text_report, generate_json_report
 from elftriage.types import AnalysisResult
@@ -56,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
 def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
     """Run the full analysis pipeline on a binary.
 
+    Pipeline stages:
+    1. Parse and validate the ELF binary.
+    2. Detect binary protections (NX, PIE, canary, RELRO, FORTIFY).
+    3. Resolve dangerous imports via PLT/GOT.
+    4. Detect function boundaries.
+    5. Disassemble call sites with context.
+    6. Analyze argument provenance at each call site.
+    7. Classify and rank findings with exploitability notes.
+
     Args:
         binary_path: Path to the ELF binary.
         context_lines: Disassembly context window size.
@@ -63,11 +74,12 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
     Returns:
         Complete analysis result.
     """
-    elffile, fh = parse_elf(binary_path)
-    try:
+    with open_elf(binary_path) as elffile:
         protections = detect_protections(elffile)
         imports = resolve_dangerous_imports(elffile)
-        call_sites = disassemble_call_sites(elffile, imports, context_lines)
+        functions = detect_functions(elffile)
+        call_sites = disassemble_call_sites(elffile, imports, context_lines, functions)
+        call_sites = analyze_call_arguments(elffile, call_sites)
         findings = classify_findings(imports, call_sites, protections)
 
         # Build summary stats
@@ -75,18 +87,21 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
             "total_dangerous_imports": len(imports),
             "critical": sum(1 for i in imports if i.category == "critical"),
             "warning": sum(1 for i in imports if i.category == "warning"),
+            "format_string": sum(1 for i in imports if i.category == "format_string"),
             "mitigated": sum(1 for i in imports if i.category == "mitigated"),
             "total_call_sites": len(call_sites),
+            "format_string_risks": sum(
+                1 for s in call_sites if s.is_format_string_risk
+            ),
         }
 
         return AnalysisResult(
             binary_path=binary_path,
             protections=protections,
             findings=findings,
+            functions=functions,
             summary_stats=summary,
         )
-    finally:
-        fh.close()
 
 
 def main(argv: Optional[list[str]] = None) -> None:

@@ -35,8 +35,34 @@ def _detect_nx(elffile: ELFFile) -> bool:
 
 
 def _detect_pie(elffile: ELFFile) -> bool:
-    """PIE enabled if ELF type is ET_DYN (shared object / PIE executable)."""
-    return bool(elffile.header.e_type == "ET_DYN")
+    """PIE enabled if ELF type is ET_DYN and DF_1_PIE flag is set.
+
+    ET_DYN alone is not sufficient — shared libraries are also ET_DYN.
+    We check DT_FLAGS_1 for the DF_1_PIE bit (0x08000000) to distinguish
+    PIE executables from shared objects. If DT_FLAGS_1 is absent but the
+    binary is ET_DYN with a PT_INTERP segment, it is likely a PIE executable
+    (older toolchains did not set DF_1_PIE).
+    """
+    if elffile.header.e_type != "ET_DYN":
+        return False
+
+    # Check DT_FLAGS_1 for DF_1_PIE (definitive)
+    for section in elffile.iter_sections():
+        if not isinstance(section, DynamicSection):
+            continue
+        for tag in section.iter_tags():
+            if tag.entry.d_tag == "DT_FLAGS_1":
+                # DF_1_PIE = 0x08000000
+                if tag.entry.d_val & 0x08000000:
+                    return True
+                return False
+
+    # Fallback: ET_DYN with PT_INTERP means it's an executable (PIE),
+    # not a shared library. Older toolchains don't emit DF_1_PIE.
+    has_interp = any(
+        seg.header.p_type == "PT_INTERP" for seg in elffile.iter_segments()
+    )
+    return has_interp
 
 
 def _detect_canary(elffile: ELFFile) -> bool:

@@ -1,5 +1,7 @@
 """Shared test fixtures."""
 
+from typing import Generator
+
 import pytest
 
 from elftools.elf.elffile import ELFFile
@@ -15,9 +17,9 @@ def bin_ls_path() -> str:
 
 
 @pytest.fixture
-def bin_ls_elffile() -> ELFFile:
+def bin_ls_elffile() -> Generator[ELFFile, None, None]:
     """Parsed ELFFile for /bin/ls. Caller must not close the underlying file."""
     f = open(BIN_LS, "rb")
     elffile = ELFFile(f)
-    yield elffile  # type: ignore[misc]
+    yield elffile
     f.close()
