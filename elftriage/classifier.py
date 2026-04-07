@@ -27,6 +27,7 @@ from elftriage.types import (
     ExploitScenario,
     Finding,
     ProtectionInfo,
+    Reachability,
 )
 
 # Weights for each condition when computing the additive severity score.
@@ -42,6 +43,11 @@ _CONDITION_WEIGHTS: dict[str, float] = {
     "no_relro": 3,
     "multiple_call_sites": 2,
     "fortified": -5,
+    # Reachability is informational only: satisfied contributes 0.
+    # A proved-unreachable penalty is applied directly in
+    # ``_compute_severity_score`` (it is never produced by the basic
+    # r2-based call graph but is reserved for future analysers).
+    "reachable_from_entry": 0,
 }
 
 # Titles and descriptions for each exploit primitive scenario.
@@ -74,6 +80,7 @@ def classify_findings(
     call_sites: list[CallSite],
     protections: ProtectionInfo,
     stack_layouts: dict[str, StackFrameLayout] | None = None,
+    reachability_by_func: dict[str, Reachability] | None = None,
 ) -> list[Finding]:
     """Classify and rank findings using an additive condition-based model.
 
@@ -87,6 +94,10 @@ def classify_findings(
         protections: Binary protection status.
         stack_layouts: Optional mapping of function name to its
             reconstructed stack frame layout.
+        reachability_by_func: Optional mapping of containing-function
+            name to :class:`Reachability`. When ``None``, every finding
+            is tagged ``UNKNOWN`` and the reachability condition is
+            added with confidence ``UNKNOWN``.
 
     Returns:
         List of findings sorted by severity score (highest first).
@@ -102,7 +113,11 @@ def classify_findings(
         # Look up stack frame layout for both conditions and notes.
         layout = _find_layout_for_sites(func_sites, stack_layouts)
 
-        conditions = _build_conditions(imp, func_sites, protections, layout)
+        reach = _aggregate_reachability(func_sites, reachability_by_func)
+
+        conditions = _build_conditions(
+            imp, func_sites, protections, layout, reach, reachability_by_func is None
+        )
         score = _compute_severity_score(conditions)
         primitive = _determine_primitive(conditions, imp.category)
 
@@ -116,11 +131,37 @@ def classify_findings(
                 exploitability_notes=notes,
                 exploit_conditions=conditions,
                 exploit_primitive=primitive,
+                reachability=reach,
             )
         )
 
     findings.sort(key=lambda f: f.severity_score, reverse=True)
     return findings
+
+
+def _aggregate_reachability(
+    call_sites: list[CallSite],
+    reachability_by_func: dict[str, Reachability] | None,
+) -> Reachability:
+    """Pick the best reachability state across a finding's call sites.
+
+    A single ``REACHABLE`` site wins. ``UNREACHABLE`` is only adopted
+    when every site with a known state is ``UNREACHABLE``. Missing or
+    empty ``reachability_by_func`` maps to ``UNKNOWN``.
+    """
+    if not reachability_by_func:
+        return Reachability.UNKNOWN
+
+    best = Reachability.UNKNOWN
+    for site in call_sites:
+        state = reachability_by_func.get(site.containing_function)
+        if state is None:
+            continue
+        if state == Reachability.REACHABLE:
+            return Reachability.REACHABLE
+        if state == Reachability.UNREACHABLE and best == Reachability.UNKNOWN:
+            best = Reachability.UNREACHABLE
+    return best
 
 
 def build_exploit_scenarios(
@@ -194,6 +235,8 @@ def _build_conditions(
     call_sites: list[CallSite],
     protections: ProtectionInfo,
     stack_layout: StackFrameLayout | None = None,
+    reachability: Reachability = Reachability.UNKNOWN,
+    reachability_unavailable: bool = True,
 ) -> list[ExploitCondition]:
     """Build the full list of exploit conditions for a single finding.
 
@@ -371,7 +414,68 @@ def _build_conditions(
         )
     )
 
+    # Reachability — tri-state, honest. Absence of a path is UNKNOWN.
+    conditions.append(
+        _build_reachability_condition(reachability, reachability_unavailable)
+    )
+
     return conditions
+
+
+def _build_reachability_condition(
+    reachability: Reachability,
+    unavailable: bool,
+) -> ExploitCondition:
+    """Build the ``reachable_from_entry`` condition.
+
+    A single condition name is used regardless of the observed state;
+    only the ``satisfied`` and ``confidence`` fields change. ``satisfied``
+    means "we have evidence the finding is reachable from an entry
+    point". When the call graph is unavailable at all, we still emit
+    the condition with confidence ``UNKNOWN`` and a caveat so that the
+    report makes the capability gap visible per-finding.
+    """
+    if unavailable:
+        return ExploitCondition(
+            name="reachable_from_entry",
+            satisfied=False,
+            confidence=ConditionConfidence.UNKNOWN,
+            detail="Call graph unavailable",
+            caveats=["install '.[callgraph]' extra and ensure 'r2' on PATH"],
+        )
+
+    if reachability == Reachability.REACHABLE:
+        return ExploitCondition(
+            name="reachable_from_entry",
+            satisfied=True,
+            confidence=ConditionConfidence.INFERRED,
+            detail="Reachable from an entry point via direct calls",
+            caveats=[
+                "call graph from r2 aaa",
+                "may miss indirect calls / callbacks / vtables",
+            ],
+        )
+
+    if reachability == Reachability.UNREACHABLE:
+        # This branch is currently only reached in synthetic tests —
+        # see callgraph.py for why basic extraction never emits it.
+        return ExploitCondition(
+            name="reachable_from_entry",
+            satisfied=False,
+            confidence=ConditionConfidence.CONFIRMED,
+            detail="Proved unreachable (e.g. discarded section)",
+        )
+
+    return ExploitCondition(
+        name="reachable_from_entry",
+        satisfied=False,
+        confidence=ConditionConfidence.UNKNOWN,
+        detail="No static path found from an entry point",
+        caveats=[
+            "absence of a call-graph edge is not proof of dead code",
+            "indirect calls / callbacks / vtables may still reach this code",
+        ],
+    )
 
 
 def _fmt_arg_unresolved(site: CallSite, func_name: str) -> bool:
@@ -458,7 +562,9 @@ def _compute_severity_score(conditions: list[ExploitCondition]) -> float:
     """Compute the additive severity score from satisfied conditions.
 
     The score is the sum of weights for each satisfied condition,
-    clamped to a minimum of 0.
+    clamped to a minimum of 0. A small penalty is applied when the
+    reachability condition is *confirmed* unreachable — positive proof
+    of dead code — but never for mere absence of a call-graph edge.
 
     Args:
         conditions: List of exploit conditions.
@@ -470,6 +576,11 @@ def _compute_severity_score(conditions: list[ExploitCondition]) -> float:
     for cond in conditions:
         if cond.satisfied:
             total += _CONDITION_WEIGHTS.get(cond.name, 0)
+        elif (
+            cond.name == "reachable_from_entry"
+            and cond.confidence == ConditionConfidence.CONFIRMED
+        ):
+            total -= 2
     return max(0.0, total)
 
 

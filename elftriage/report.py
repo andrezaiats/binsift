@@ -12,6 +12,7 @@ from elftriage.types import (
     ExploitScenario,
     Finding,
     ProtectionInfo,
+    Reachability,
 )
 
 
@@ -115,6 +116,8 @@ def _format_finding(index: int, finding: Finding) -> list[str]:
         lines.append(f"      GOT address: 0x{imp.got_address:x}")
     lines.append(f"      Severity score: {finding.severity_score}")
     lines.append(f"      Call sites: {len(finding.call_sites)}")
+    if finding.reachability != Reachability.UNKNOWN:
+        lines.append(f"      Reachability: {finding.reachability.value.upper()}")
 
     # Exploitability notes
     if finding.exploitability_notes:
@@ -333,6 +336,7 @@ def _finding_to_dict(finding: Finding) -> dict[str, Any]:
             _condition_to_dict(c) for c in finding.exploit_conditions
         ]
         result["exploit_primitive"] = finding.exploit_primitive.value
+    result["reachability"] = finding.reachability.value
     return result
 
 

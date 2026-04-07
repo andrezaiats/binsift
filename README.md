@@ -218,6 +218,25 @@ Conditions that are `INFERRED` carry a `caveats` list explaining *why* the evide
 
 When optional analysis backends are unavailable (e.g. call-graph or IR-based taint engines added in later phases), the report opens with a `Capability Warnings` section listing what could not run. This makes it impossible for two environments to silently produce materially different reports for the same binary.
 
+## Reachability (optional)
+
+BinSift can optionally build a call graph via [radare2](https://github.com/radareorg/radare2) and tag each finding with a three-state reachability status. This downranks findings in dead code paths — with important caveats.
+
+Install the extra dependency and ensure `r2` is on your PATH:
+
+```bash
+pip install -e ".[callgraph]"
+which r2   # radare2 must be installed separately
+```
+
+When the backend is available, each finding gains a `Reachability` tag in the text report and a `reachability` field in the JSON output:
+
+- **REACHABLE** — the call graph shows a direct-call path from an entry point (`main`, `_start`, `entry0`) to the finding's containing function. This is reported with `INFERRED` confidence because the basic `aaa` extraction misses indirect calls, callbacks, vtables, and `.init`/`.fini` array handlers.
+- **UNREACHABLE** — reserved for positive proof that the code cannot run (e.g. a symbol in a discarded section). The basic r2 call graph never emits this state, but it is available for future backends. When set, applies a small score penalty.
+- **UNKNOWN** — the default, and also the result when no static path is found. **Absence of a call-graph edge is never treated as proof of dead code.**
+
+When the backend is unavailable, the top-level `Capability Warnings` section names the gap, each finding's `reachable_from_entry` condition shows `[UNKNOWN]` with a caveat telling the user exactly which extras to install, and no scoring decision depends on reachability.
+
 ## Exploit Primitives
 
 Findings are classified by the type of exploit primitive they may enable, then grouped into scenarios:

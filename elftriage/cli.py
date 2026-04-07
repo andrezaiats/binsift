@@ -12,8 +12,14 @@ from elftriage.functions import detect_functions
 from elftriage.arganalysis import analyze_call_arguments
 from elftriage.classifier import classify_findings, build_exploit_scenarios
 from elftriage.stackframe import StackFrameLayout, analyze_stack_frame
+from elftriage.callgraph import (
+    CAPABILITY_WARNING as REACHABILITY_CAPABILITY_WARNING,
+    CallGraph,
+    build_call_graph,
+    reachable_from_entry,
+)
 from elftriage.report import generate_text_report, generate_json_report
-from elftriage.types import AnalysisResult, FunctionBoundary
+from elftriage.types import AnalysisResult, FunctionBoundary, Reachability
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,7 +91,23 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
         # Build stack frame layouts for functions containing call sites
         stack_layouts = _build_stack_layouts(elffile, call_sites, functions)
 
-        findings = classify_findings(imports, call_sites, protections, stack_layouts)
+        # Reachability: optional, degrades visibly via capability_warnings.
+        capability_warnings: list[str] = []
+        graph = build_call_graph(binary_path)
+        if graph is None:
+            capability_warnings.append(REACHABILITY_CAPABILITY_WARNING)
+            reachability_by_func: dict[str, Reachability] | None = None
+        else:
+            reachability_by_func = _reachability_for_call_sites(call_sites, graph)
+
+        findings = classify_findings(
+            imports,
+            call_sites,
+            protections,
+            stack_layouts,
+            reachability_by_func,
+        )
+
         scenarios = build_exploit_scenarios(findings, protections)
 
         # Build summary stats
@@ -108,7 +130,28 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
             functions=functions,
             summary_stats=summary,
             exploit_scenarios=scenarios,
+            capability_warnings=capability_warnings,
         )
+
+
+def _reachability_for_call_sites(
+    call_sites: Sequence[object],
+    graph: CallGraph,
+) -> dict[str, Reachability]:
+    """Compute the reachability of every containing function in *call_sites*.
+
+    Returns a mapping keyed by containing-function name so the
+    classifier can look it up per-finding without re-traversing the
+    graph. Functions that have no static path from an entry point map
+    to ``UNKNOWN`` — absence of an edge is never proof of dead code.
+    """
+    by_func: dict[str, Reachability] = {}
+    for site in call_sites:
+        fn = getattr(site, "containing_function", "")
+        if not fn or fn in by_func:
+            continue
+        by_func[fn] = reachable_from_entry(graph, fn)
+    return by_func
 
 
 def _build_stack_layouts(

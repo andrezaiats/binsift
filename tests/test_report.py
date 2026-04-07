@@ -14,6 +14,7 @@ from elftriage.types import (
     ExploitCondition,
     Finding,
     ProtectionInfo,
+    Reachability,
 )
 
 
@@ -228,3 +229,27 @@ def test_json_report_call_site_copy_size() -> None:
     data = json.loads(generate_json_report(result))
     site = data["findings"][0]["call_sites"][0]
     assert site["copy_size"] == 0x100
+
+
+def test_text_report_shows_reachability_when_known() -> None:
+    """Findings marked REACHABLE surface that state in the text report."""
+    result = _sample_result()
+    result.findings[0].reachability = Reachability.REACHABLE
+    report = generate_text_report(result)
+    assert "Reachability: REACHABLE" in report
+
+
+def test_text_report_omits_reachability_when_unknown() -> None:
+    """UNKNOWN reachability is not rendered — it's the default."""
+    result = _sample_result()
+    result.findings[0].reachability = Reachability.UNKNOWN
+    report = generate_text_report(result)
+    assert "Reachability:" not in report
+
+
+def test_json_report_always_emits_reachability() -> None:
+    """JSON output always includes a reachability field for each finding."""
+    result = _sample_result()
+    result.findings[0].reachability = Reachability.REACHABLE
+    data = json.loads(generate_json_report(result))
+    assert data["findings"][0]["reachability"] == "reachable"

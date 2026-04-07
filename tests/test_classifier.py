@@ -9,6 +9,7 @@ from elftriage.types import (
     ConditionConfidence,
     DangerousImport,
     ProtectionInfo,
+    Reachability,
 )
 
 
@@ -233,6 +234,67 @@ def test_copy_size_exceeds_buffer_unknown_when_no_size() -> None:
     cond = _conditions_by_name(findings[0])["copy_size_exceeds_buffer"]
     assert cond.satisfied is False  # type: ignore[attr-defined]
     assert cond.confidence == ConditionConfidence.UNKNOWN  # type: ignore[attr-defined]
+
+
+def test_reachability_unavailable_when_no_map() -> None:
+    """No reachability map → condition is UNKNOWN with installation caveat."""
+    imports = [DangerousImport("strcpy", "critical", "Overflow", 0x1000)]
+    protections = ProtectionInfo()
+    findings = classify_findings(imports, [], protections)
+    cond = _conditions_by_name(findings[0])["reachable_from_entry"]
+    assert cond.satisfied is False  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.UNKNOWN  # type: ignore[attr-defined]
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert any("callgraph" in c for c in caveats)
+    assert findings[0].reachability == Reachability.UNKNOWN
+
+
+def test_reachability_reachable_inferred_with_caveats() -> None:
+    """REACHABLE state → condition INFERRED (call graph is heuristic)."""
+    imports = [DangerousImport("strcpy", "critical", "Overflow", 0x1000)]
+    protections = ProtectionInfo()
+    site = CallSite(0x5000, "strcpy", containing_function="vuln")
+    reach_map = {"vuln": Reachability.REACHABLE}
+
+    findings = classify_findings(
+        imports, [site], protections, reachability_by_func=reach_map
+    )
+    cond = _conditions_by_name(findings[0])["reachable_from_entry"]
+    assert cond.satisfied is True  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.INFERRED  # type: ignore[attr-defined]
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert any("indirect" in c for c in caveats)
+    assert findings[0].reachability == Reachability.REACHABLE
+
+
+def test_reachability_no_static_path_is_unknown_not_unreachable() -> None:
+    """A call graph that lacks an edge → UNKNOWN with dead-code caveat."""
+    imports = [DangerousImport("strcpy", "critical", "Overflow", 0x1000)]
+    protections = ProtectionInfo()
+    site = CallSite(0x5000, "strcpy", containing_function="vuln")
+    # Empty map means: call graph available but no entry was found for vuln
+    findings = classify_findings(imports, [site], protections, reachability_by_func={})
+    cond = _conditions_by_name(findings[0])["reachable_from_entry"]
+    assert cond.satisfied is False  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.UNKNOWN  # type: ignore[attr-defined]
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert any("dead code" in c for c in caveats)
+
+
+def test_proved_unreachable_applies_penalty() -> None:
+    """CONFIRMED unreachable applies a −2 score penalty."""
+    imports = [DangerousImport("strcpy", "critical", "Overflow", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+
+    baseline = classify_findings(imports, [], protections)
+
+    site = CallSite(0x5000, "strcpy", containing_function="vuln")
+    reach_map = {"vuln": Reachability.UNREACHABLE}
+    penalized = classify_findings(
+        imports, [site], protections, reachability_by_func=reach_map
+    )
+
+    assert penalized[0].severity_score <= baseline[0].severity_score
 
 
 def test_copy_size_within_buffer_does_not_fire() -> None:

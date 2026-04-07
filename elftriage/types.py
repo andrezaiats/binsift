@@ -36,6 +36,21 @@ class ArgSource(Enum):
     UNKNOWN = "unknown"
 
 
+class Reachability(Enum):
+    """Whether a finding is reachable from the program's entry points.
+
+    ``UNKNOWN`` is the default and is also used whenever the call graph
+    simply does not contain an edge — absence of evidence is not
+    evidence of absence. ``UNREACHABLE`` is reserved for the rare cases
+    where there is positive proof the code cannot run (e.g. a symbol
+    living in a discarded section).
+    """
+
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class ProtectionInfo:
     """Binary protection status flags."""
@@ -128,6 +143,7 @@ class Finding:
     exploitability_notes: list[str] = field(default_factory=list)
     exploit_conditions: list[ExploitCondition] = field(default_factory=list)
     exploit_primitive: ExploitPrimitive = ExploitPrimitive.NONE
+    reachability: Reachability = Reachability.UNKNOWN
 
 
 @dataclass
