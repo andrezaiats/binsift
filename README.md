@@ -4,6 +4,41 @@ A static analysis triage tool for x86_64 ELF binaries. BinSift identifies danger
 
 This is a **triage layer**, not an exploit generator. It narrows the search space for security researchers by answering: *"What can I exploit first, how easily, and what evidence supports that?"*
 
+## Honest scope
+
+BinSift exists in a space full of tools that overclaim. This section tries not to. Read it before deciding whether the tool fits your workflow — it is meant to calibrate expectations, not to sell anything.
+
+### What it is good at
+
+- **First-pass triage of unknown binaries.** If you have fifty ELFs and need to decide which five to open in Ghidra, running BinSift on all of them in a few seconds is a real time saver. The protections panel, dangerous imports list, and call-site context give you the same information you would piece together manually from `checksec`, `readelf`, and `objdump`, in one pass.
+- **Explaining *why* a finding is or isn't suspicious.** Every condition carries a confidence level (`CONFIRMED` / `INFERRED` / `UNKNOWN`) and structured `caveats` naming the blind spots of the heuristic that produced it. When promotion to `CONFIRMED` is blocked, the report states exactly which gate failed (`"IR detected pointer escape"`, `"function is recursive"`, `"copy length is not a visible constant"`). This is unusual for tools in this category and, in our view, is the most valuable thing BinSift offers.
+- **CTF and teaching contexts.** Small binaries with known vulnerabilities, compiled across multiple protection profiles, are exactly the sweet spot. The output is genuinely didactic.
+- **Sanity-check in CI or code review.** "Did this PR really intend to ship a binary without stack canaries and with `RELRO=none`?" is a question BinSift answers without fuss.
+- **Building block in larger pipelines.** The JSON output and the capability-warnings plumbing are designed to be consumed by downstream tooling (e.g. feed the top-N findings into angr or a manual review queue).
+
+### What it is *not* good at — and will not be with the current architecture
+
+- **It does not confirm exploits.** Nothing in the tool proves that a given finding is actually reachable with attacker-controlled input. The `copy_size_exceeds_buffer` condition is the closest we get, and it fires rarely in real binaries because compilers inline-size most fixed-length copies away. Users expecting "show me the bug" will be frustrated.
+- **Stripped binaries are today's majority, and we handle them poorly.** On `/bin/ls` only 1 of 78 call sites gets IR-based taint, because the built-in function-boundary detector cannot map the containing function for most sites without symbols. A future improvement is to delegate boundary detection to radare2, which is already an optional dependency; today it is a real limitation.
+- **The pointer-escape check is aggressively conservative.** Any stack buffer that reaches more than one call in the same function is reported as escaping. `strcpy(buf, …); printf("%s", buf);` is a benign pattern in practice but trips the check and blocks promotion to `CONFIRMED`. The consequence is that in most real-world binaries, `dest_is_stack` almost never reaches `CONFIRMED` and the distinction between `INFERRED` and `CONFIRMED` can feel like noise. This is a deliberate safety choice — the alternative is promoting false positives — but it is a real usability cost.
+- **Bug coverage is narrow.** BinSift only looks at unsafe memory operations via known libc imports and format-string risk. It does not reason about heap bugs (UAF, double-free, heap overflow), race conditions, integer overflow, C++ vtables / RTTI, virtual dispatch, function pointers, or signal handlers. Most high-value exploitable bugs in modern software live in those classes, and nothing here helps with them.
+- **It does not replace Ghidra, IDA, angr, or a skilled reverse engineer.** Ghidra already decompiles and does reasonable data flow. angr actually checks reachability symbolically. For a single high-stakes binary, those tools are strictly more informative than BinSift. If you were going to open Ghidra anyway, the triage step saves at best thirty seconds of orientation.
+- **Format-string `%n` chains, ROP/ret2libc generation, and reachability-by-execution-path are all explicitly out of scope** and always will be. BinSift reports the conditions that make them *possible*; it does not attempt to construct them.
+
+### Where `INFERRED` and `UNKNOWN` are not the same as "false"
+
+A recurring point of confusion: when a condition is `UNKNOWN`, the tool is saying "I declined to commit either way", not "I determined this is false". And when a condition is `INFERRED`, the tool is saying "my heuristic fired, but I am not willing to stake my name on it — here are the caveats". Treat `INFERRED` results as hypotheses to check in your disassembler, not as facts to act on.
+
+### Honest bar for success
+
+BinSift is worth your time if *at least one* of these is true:
+
+1. You triage many binaries and need to prioritise which to inspect manually.
+2. You are learning about binary protections, PLT/GOT, and exploitation primitives, and want a tool whose output you can trust to be explanatory rather than aspirational.
+3. You want a JSON-producing building block for your own pipelines.
+
+If what you actually want is "tell me where the bug is", use Ghidra, angr, AFL++ or a commercial fuzzer. BinSift will not give you that, and the commit history shows a deliberate refusal to pretend otherwise.
+
 ## Features
 
 - **Binary protection detection** — NX, PIE (with DF_1_PIE validation), stack canaries, RELRO (none/partial/full), FORTIFY_SOURCE
