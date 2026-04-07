@@ -18,6 +18,10 @@ from elftriage.callgraph import (
     build_call_graph,
     reachable_from_entry,
 )
+from elftriage.ir import (
+    CAPABILITY_WARNING as IR_CAPABILITY_WARNING,
+    IR_AVAILABLE,
+)
 from elftriage.report import generate_text_report, generate_json_report
 from elftriage.types import AnalysisResult, FunctionBoundary, Reachability
 
@@ -86,19 +90,23 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
         imports = resolve_dangerous_imports(elffile)
         functions = detect_functions(elffile)
         call_sites = disassemble_call_sites(elffile, imports, context_lines, functions)
-        call_sites = analyze_call_arguments(elffile, call_sites)
+        call_sites = analyze_call_arguments(elffile, call_sites, functions)
 
         # Build stack frame layouts for functions containing call sites
         stack_layouts = _build_stack_layouts(elffile, call_sites, functions)
 
         # Reachability: optional, degrades visibly via capability_warnings.
         capability_warnings: list[str] = []
+        if not IR_AVAILABLE:
+            capability_warnings.append(IR_CAPABILITY_WARNING)
         graph = build_call_graph(binary_path)
         if graph is None:
             capability_warnings.append(REACHABILITY_CAPABILITY_WARNING)
             reachability_by_func: dict[str, Reachability] | None = None
+            recursive_funcs: set[str] = set()
         else:
             reachability_by_func = _reachability_for_call_sites(call_sites, graph)
+            recursive_funcs = _detect_recursive_functions(graph)
 
         findings = classify_findings(
             imports,
@@ -106,6 +114,7 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
             protections,
             stack_layouts,
             reachability_by_func,
+            recursive_funcs,
         )
 
         scenarios = build_exploit_scenarios(findings, protections)
@@ -132,6 +141,22 @@ def analyze(binary_path: str, context_lines: int = 5) -> AnalysisResult:
             exploit_scenarios=scenarios,
             capability_warnings=capability_warnings,
         )
+
+
+def _detect_recursive_functions(graph: CallGraph) -> set[str]:
+    """Return the set of functions that directly call themselves.
+
+    A pragmatic recursion check: only direct (``foo`` calls ``foo``)
+    self-loops in the call graph. Mutual recursion is not modelled,
+    but the consumer (the ``dest_is_stack`` promotion rule) is
+    intentionally cautious about recursion in general — see
+    :func:`elftriage.classifier._build_dest_is_stack_condition`.
+    """
+    recursive: set[str] = set()
+    for caller, callees in graph.edges.items():
+        if caller in callees:
+            recursive.add(caller)
+    return recursive
 
 
 def _reachability_for_call_sites(

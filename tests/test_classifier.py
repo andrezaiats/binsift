@@ -297,6 +297,110 @@ def test_proved_unreachable_applies_penalty() -> None:
     assert penalized[0].severity_score <= baseline[0].severity_score
 
 
+def test_dest_is_stack_promoted_to_confirmed_with_ir() -> None:
+    """IR + non-escaping + non-recursive + constant copy_size → CONFIRMED."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x80,
+        taint_method="ir",
+        stack_dest_escapes=False,
+    )
+    findings = classify_findings(imports, [site], protections, recursive_funcs=set())
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.CONFIRMED
+
+
+def test_dest_is_stack_blocked_by_pointer_escape() -> None:
+    """Even with IR, an escaping slot stays INFERRED with caveats."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x80,
+        taint_method="ir",
+        stack_dest_escapes=True,
+    )
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.INFERRED
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert any("escape" in c for c in caveats)
+
+
+def test_dest_is_stack_blocked_by_recursion() -> None:
+    """A recursive function never promotes — slot reuse across invocations."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="recursive_func",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x80,
+        taint_method="ir",
+        stack_dest_escapes=False,
+    )
+    findings = classify_findings(
+        imports, [site], protections, recursive_funcs={"recursive_func"}
+    )
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.INFERRED
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert any("recursive" in c for c in caveats)
+
+
+def test_dest_is_stack_blocked_without_constant_copy_size() -> None:
+    """A non-constant copy_size keeps the condition at INFERRED."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=None,
+        taint_method="ir",
+        stack_dest_escapes=False,
+    )
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.INFERRED
+
+
+def test_dest_is_stack_slice_path_never_promotes() -> None:
+    """Slice-derived stack destinations always stay INFERRED."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x80,
+        taint_method="slice",  # default; explicit for clarity
+        stack_dest_escapes=None,
+    )
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.INFERRED
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    # slice caveats, not IR caveats
+    assert any("windowed slice" in c for c in caveats)
+
+
 def test_copy_size_within_buffer_does_not_fire() -> None:
     """copy_size <= slot size must NOT mark the condition satisfied."""
     imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]

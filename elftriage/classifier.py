@@ -81,6 +81,7 @@ def classify_findings(
     protections: ProtectionInfo,
     stack_layouts: dict[str, StackFrameLayout] | None = None,
     reachability_by_func: dict[str, Reachability] | None = None,
+    recursive_funcs: set[str] | None = None,
 ) -> list[Finding]:
     """Classify and rank findings using an additive condition-based model.
 
@@ -116,7 +117,13 @@ def classify_findings(
         reach = _aggregate_reachability(func_sites, reachability_by_func)
 
         conditions = _build_conditions(
-            imp, func_sites, protections, layout, reach, reachability_by_func is None
+            imp,
+            func_sites,
+            protections,
+            layout,
+            reach,
+            reachability_by_func is None,
+            recursive_funcs or set(),
         )
         score = _compute_severity_score(conditions)
         primitive = _determine_primitive(conditions, imp.category)
@@ -237,6 +244,7 @@ def _build_conditions(
     stack_layout: StackFrameLayout | None = None,
     reachability: Reachability = Reachability.UNKNOWN,
     reachability_unavailable: bool = True,
+    recursive_funcs: set[str] | None = None,
 ) -> list[ExploitCondition]:
     """Build the full list of exploit conditions for a single finding.
 
@@ -300,28 +308,9 @@ def _build_conditions(
         )
     )
 
-    # Argument-based conditions — INFERRED, derived from the slice.
-    has_stack_dest = any(
-        arg.register == "rdi" and arg.source == ArgSource.STACK
-        for site in call_sites
-        for arg in site.arguments
-    )
+    # Argument-based conditions — confidence depends on backend.
     conditions.append(
-        ExploitCondition(
-            name="dest_is_stack",
-            satisfied=has_stack_dest,
-            confidence=(
-                ConditionConfidence.INFERRED
-                if has_stack_dest
-                else ConditionConfidence.UNKNOWN
-            ),
-            detail=(
-                "Destination (rdi) points to a stack buffer"
-                if has_stack_dest
-                else "Destination target unknown"
-            ),
-            caveats=list(_SLICE_CAVEATS) if has_stack_dest else [],
-        )
+        _build_dest_is_stack_condition(call_sites, recursive_funcs or set())
     )
 
     has_input_src = any(
@@ -475,6 +464,96 @@ def _build_reachability_condition(
             "absence of a call-graph edge is not proof of dead code",
             "indirect calls / callbacks / vtables may still reach this code",
         ],
+    )
+
+
+def _build_dest_is_stack_condition(
+    call_sites: list[CallSite],
+    recursive_funcs: set[str],
+) -> ExploitCondition:
+    """Build the ``dest_is_stack`` condition with backend-aware confidence.
+
+    Confidence climbs out of ``INFERRED`` only when:
+      1. The argument came from the IR backend (taint_method == "ir")
+      2. The IR confirmed the slot does not escape to another call
+      3. The containing function is not recursive (so the slot is
+         not effectively reused across invocations)
+      4. A constant ``copy_size`` is visible (so the comparison
+         against the slot's upper-bound size is meaningful)
+
+    Slice-derived stack destinations always remain ``INFERRED`` with
+    the standard slice caveats. The slice cannot rule out aliasing,
+    pointer escape, or instruction reordering — promotion under those
+    constraints would be unsound.
+    """
+    stack_sites: list[CallSite] = []
+    for site in call_sites:
+        if any(
+            arg.register == "rdi" and arg.source == ArgSource.STACK
+            for arg in site.arguments
+        ):
+            stack_sites.append(site)
+
+    if not stack_sites:
+        return ExploitCondition(
+            name="dest_is_stack",
+            satisfied=False,
+            confidence=ConditionConfidence.UNKNOWN,
+            detail="Destination target unknown",
+        )
+
+    # Look for at least one site that meets every promotion criterion.
+    promoted_site: CallSite | None = None
+    blocking_caveats: list[str] = []
+    for site in stack_sites:
+        if site.taint_method != "ir":
+            continue
+        reasons: list[str] = []
+        if site.stack_dest_escapes is True:
+            reasons.append("IR detected pointer escape — slot may be aliased")
+        elif site.stack_dest_escapes is None:
+            reasons.append("IR did not run escape check")
+        if site.containing_function in recursive_funcs:
+            reasons.append("function is recursive — slot reused across calls")
+        if site.copy_size is None:
+            reasons.append("copy length is not a visible constant")
+
+        if not reasons:
+            promoted_site = site
+            break
+        # Track the most informative blocking reasons across sites.
+        if not blocking_caveats:
+            blocking_caveats = reasons
+
+    if promoted_site is not None:
+        return ExploitCondition(
+            name="dest_is_stack",
+            satisfied=True,
+            confidence=ConditionConfidence.CONFIRMED,
+            detail="Destination (rdi) provably points to a stack buffer",
+            caveats=[
+                "IR-based taint",
+                "non-escaping slot",
+                "non-recursive function",
+            ],
+        )
+
+    # Fallback: at least one stack site exists but conditions for
+    # promotion failed (slice path, escape, recursion, or no constant).
+    ir_used = any(s.taint_method == "ir" for s in stack_sites)
+    if ir_used and blocking_caveats:
+        caveats = ["IR-based taint, but promotion blocked"] + blocking_caveats
+    elif ir_used:
+        caveats = ["IR-based taint"]
+    else:
+        caveats = list(_SLICE_CAVEATS)
+
+    return ExploitCondition(
+        name="dest_is_stack",
+        satisfied=True,
+        confidence=ConditionConfidence.INFERRED,
+        detail="Destination (rdi) points to a stack buffer",
+        caveats=caveats,
     )
 
 

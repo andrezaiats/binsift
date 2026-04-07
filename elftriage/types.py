@@ -93,7 +93,19 @@ class DisassemblyLine:
 
 @dataclass
 class CallSite:
-    """A call site referencing a dangerous function with surrounding context."""
+    """A call site referencing a dangerous function with surrounding context.
+
+    ``taint_method`` records which provenance backend populated
+    ``arguments``: ``"slice"`` (the windowed backward slice in
+    :mod:`elftriage.arganalysis`) or ``"ir"`` (the P-Code taint analyser
+    in :mod:`elftriage.taint`). The classifier uses this to decide
+    whether ``dest_is_stack`` is allowed to climb out of ``INFERRED``.
+
+    ``stack_dest_escapes`` is set by the IR backend only: ``True`` if
+    the address of the destination stack slot is observed leaving the
+    function via another call, ``False`` if the IR analysed the
+    function and saw no escape, ``None`` when the check did not run.
+    """
 
     address: int
     function_name: str
@@ -102,6 +114,8 @@ class CallSite:
     arguments: list[ArgumentInfo] = field(default_factory=list)
     is_format_string_risk: bool = False
     copy_size: Optional[int] = None
+    taint_method: str = "slice"
+    stack_dest_escapes: Optional[bool] = None
 
 
 @dataclass

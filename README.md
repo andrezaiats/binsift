@@ -237,6 +237,29 @@ When the backend is available, each finding gains a `Reachability` tag in the te
 
 When the backend is unavailable, the top-level `Capability Warnings` section names the gap, each finding's `reachable_from_entry` condition shows `[UNKNOWN]` with a caveat telling the user exactly which extras to install, and no scoring decision depends on reachability.
 
+## IR-based taint analysis (optional)
+
+BinSift can optionally lift each function containing a dangerous call site to [Ghidra P-Code](https://ghidra.re/courses/languages/html/pcoderef.html) via [pypcode](https://github.com/angr/pypcode), then run a backward reaching-definitions analysis on the SSA-friendly IR. P-Code normalises x86 register aliasing (`eax`/`rax`), exposes stack arithmetic as plain `RBP + const`, and lets the analyser see through patterns the windowed slice cannot — most importantly the very common `lea rax, [rbp - N]; mov rdi, rax` pair, which leaves the slice classifying `rdi` as `register` instead of `stack`.
+
+Install the extra dependency:
+
+```bash
+pip install -e ".[ir]"
+```
+
+When the IR backend is available and the call site has a known containing function, taint analysis runs in place of the slice. Each call site records its `taint_method` (`"ir"` or `"slice"`) and, for IR sites with a stack destination, a `stack_dest_escapes` flag. The text report shows a `Taint backend:` line per finding so it is obvious which backend produced the result.
+
+The IR backend also enables the only path by which `dest_is_stack` can be promoted from `INFERRED` to `CONFIRMED`. Promotion requires **all** of the following:
+
+1. The argument came from the IR backend (not the slice).
+2. The IR confirmed the destination's stack slot does not escape to any other call within the same function.
+3. The containing function is not directly recursive (so the slot is not effectively reused across invocations).
+4. A constant `copy_size` is visible at the call site.
+
+If any of these fails, the condition stays `INFERRED` and the report explains exactly which gate blocked promotion (e.g. `"IR detected pointer escape — slot may be aliased"`, `"function is recursive — slot reused across calls"`, `"copy length is not a visible constant"`). Slice-derived results never promote.
+
+When the IR backend is unavailable, the top-level `Capability Warnings` section names the gap, every per-finding `Taint backend:` line says `slice (IR-based taint unavailable)`, and no `dest_is_stack` condition can ever reach `CONFIRMED`.
+
 ## Exploit Primitives
 
 Findings are classified by the type of exploit primitive they may enable, then grouped into scenarios:

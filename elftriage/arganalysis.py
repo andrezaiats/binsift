@@ -9,7 +9,9 @@ analysis, but enough to classify argument provenance for triage.
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from elftools.elf.elffile import ELFFile
 
-from elftriage.types import ArgSource, ArgumentInfo, CallSite
+from elftriage.ir import IR_AVAILABLE, lift_function
+from elftriage.taint import CallTaint, taint_at_call
+from elftriage.types import ArgSource, ArgumentInfo, CallSite, FunctionBoundary
 from elftriage import dangerous_functions
 
 # SysV AMD64 ABI argument registers in order
@@ -51,22 +53,34 @@ _RSI_SIZE_FUNCTIONS = {
 def analyze_call_arguments(
     elffile: ELFFile,
     call_sites: list[CallSite],
+    functions: list[FunctionBoundary] | None = None,
 ) -> list[CallSite]:
     """Analyze argument provenance for each call site.
 
-    For each call site, scans backward from the call instruction to
-    determine where each argument register was loaded from, then
-    classifies the source.
+    Two backends are supported. When :data:`elftriage.ir.IR_AVAILABLE`
+    is true and a containing function is known, the IR-backed taint
+    analyser in :mod:`elftriage.taint` is used. Otherwise the original
+    windowed backward slice runs as a fallback. Either way the call
+    site's ``arguments``, ``copy_size``, and ``taint_method`` fields
+    are populated.
 
     Args:
         elffile: A parsed ELF file object.
         call_sites: List of call sites to analyze.
+        functions: Optional list of function boundaries. Required to
+            use the IR backend; without it every site falls back to
+            the slice.
 
     Returns:
         The same call sites with arguments field populated.
     """
     if not call_sites:
         return call_sites
+
+    # Try the IR path first when both pypcode and function boundaries
+    # are available.
+    if IR_AVAILABLE and functions:
+        _analyze_with_ir(elffile, call_sites, functions)
 
     text_section = elffile.get_section_by_name(".text")
     if text_section is None:
@@ -82,6 +96,9 @@ def analyze_call_arguments(
     md.detail = False
 
     for site in call_sites:
+        # Skip sites the IR backend already populated.
+        if site.taint_method == "ir":
+            continue
         # Disassemble a window before the call
         region_start = max(text_addr, site.address - _SLICE_DEPTH * 8)
         offset = region_start - text_addr
@@ -114,6 +131,91 @@ def analyze_call_arguments(
                 site.is_format_string_risk = True
 
     return call_sites
+
+
+def _analyze_with_ir(
+    elffile: ELFFile,
+    call_sites: list[CallSite],
+    functions: list[FunctionBoundary],
+) -> None:
+    """Populate ``call_sites`` argument data via the IR taint backend.
+
+    Groups sites by their containing function, lifts each function once,
+    runs taint at every relevant call address, and stamps each site
+    with ``taint_method = "ir"`` on success. Sites whose containing
+    function cannot be lifted (no boundary, lifter failure, call
+    address not found in the IR) are left untouched and the slice
+    backend will pick them up later.
+    """
+    func_by_name: dict[str, FunctionBoundary] = {f.name: f for f in functions}
+
+    sites_by_func: dict[str, list[CallSite]] = {}
+    for site in call_sites:
+        if not site.containing_function:
+            continue
+        sites_by_func.setdefault(site.containing_function, []).append(site)
+
+    for func_name, sites in sites_by_func.items():
+        boundary = func_by_name.get(func_name)
+        if boundary is None:
+            continue
+
+        function_ir = lift_function(elffile, boundary)
+        if function_ir is None:
+            continue
+
+        for site in sites:
+            n_args = _interesting_arg_count(site.function_name)
+            arg_regs = _ARG_REGISTERS[:n_args]
+
+            taint = taint_at_call(function_ir, site.address, arg_regs)
+            if taint is None:
+                continue
+
+            arguments: list[ArgumentInfo] = []
+            for reg in arg_regs:
+                info = taint.args.get(reg)
+                if info is None:
+                    arguments.append(
+                        ArgumentInfo(register=reg, source=ArgSource.UNKNOWN)
+                    )
+                    continue
+                arguments.append(
+                    ArgumentInfo(
+                        register=reg,
+                        source=info.source,
+                        detail=info.detail,
+                    )
+                )
+            site.arguments = arguments
+            site.taint_method = "ir"
+            site.stack_dest_escapes = taint.stack_dest_escapes
+
+            # Recover a constant copy length the same way the slice
+            # path does, but from the taint info instead.
+            site.copy_size = _ir_extract_copy_size(taint, site.function_name)
+
+            # Format string risk: format arg is the same index used
+            # by the slice backend.
+            fmt_idx = dangerous_functions.get_format_arg_index(site.function_name)
+            if fmt_idx is not None and fmt_idx < len(arguments):
+                fmt_arg = arguments[fmt_idx]
+                if fmt_arg.source != ArgSource.RODATA:
+                    site.is_format_string_risk = True
+
+
+def _ir_extract_copy_size(taint: "CallTaint", func_name: str) -> int | None:
+    """Pull a constant copy length from IR taint info, if any."""
+    if func_name in _RDX_SIZE_FUNCTIONS:
+        size_reg = "rdx"
+    elif func_name in _RSI_SIZE_FUNCTIONS:
+        size_reg = "rsi"
+    else:
+        return None
+    info = taint.args.get(size_reg)
+    if info is None or info.constant is None:
+        return None
+    return int(info.constant)
 
 
 def _extract_copy_size(

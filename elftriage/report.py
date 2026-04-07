@@ -3,6 +3,7 @@
 import json
 from typing import Any
 
+from elftriage.ir import IR_AVAILABLE
 from elftriage.types import (
     AnalysisResult,
     ArgumentInfo,
@@ -118,6 +119,19 @@ def _format_finding(index: int, finding: Finding) -> list[str]:
     lines.append(f"      Call sites: {len(finding.call_sites)}")
     if finding.reachability != Reachability.UNKNOWN:
         lines.append(f"      Reachability: {finding.reachability.value.upper()}")
+    # Per-finding marker telling the reader which taint backend ran.
+    methods = {site.taint_method for site in finding.call_sites}
+    slice_reason = (
+        "IR-based taint unavailable"
+        if not IR_AVAILABLE
+        else "containing function not lifted"
+    )
+    if methods == {"ir"}:
+        lines.append("      Taint backend: IR-based")
+    elif methods == {"slice"}:
+        lines.append(f"      Taint backend: slice ({slice_reason})")
+    elif methods:
+        lines.append("      Taint backend: mixed (some IR, some slice — see below)")
 
     # Exploitability notes
     if finding.exploitability_notes:
@@ -360,6 +374,9 @@ def _call_site_to_dict(site: CallSite) -> dict[str, Any]:
         data["format_string_risk"] = True
     if site.copy_size is not None:
         data["copy_size"] = site.copy_size
+    data["taint_method"] = site.taint_method
+    if site.stack_dest_escapes is not None:
+        data["stack_dest_escapes"] = site.stack_dest_escapes
     return data
 
 
