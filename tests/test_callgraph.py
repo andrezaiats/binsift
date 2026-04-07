@@ -24,6 +24,8 @@ from elftriage.types import Reachability
 def test_normalize_strips_sym_prefix() -> None:
     assert _normalize("sym.main") == "main"
     assert _normalize("sym.imp.strcpy") == "strcpy"
+    assert _normalize("dbg.vulnerable_function") == "vulnerable_function"
+    assert _normalize("reloc.__libc_start_main") == "__libc_start_main"
     assert _normalize("main") == "main"
     assert _normalize("") == ""
 
@@ -66,15 +68,36 @@ def test_parse_aflmj_builds_edges_and_entry_points() -> None:
     assert graph.edges["unreachable_helper"] == {"memcpy"}
 
 
+def test_parse_aflmj_modern_schema_with_calls_field() -> None:
+    """Modern r2 emits a `calls` array (no `type`); the parser handles both."""
+    data = [
+        {
+            "name": "dbg.main",
+            "calls": [
+                {"name": "dbg.vulnerable_function"},
+                {"name": "sym.imp.printf"},
+            ],
+        },
+        {
+            "name": "dbg.vulnerable_function",
+            "calls": [{"name": "sym.imp.strcpy"}],
+        },
+    ]
+    graph = _parse_aflmj(data)
+    assert graph.edges["main"] == {"vulnerable_function", "printf"}
+    assert graph.edges["vulnerable_function"] == {"strcpy"}
+    assert "main" in graph.entry_points
+
+
 def test_parse_aflmj_ignores_nameless_refs() -> None:
-    """Callrefs without a name (raw indirect calls) are skipped."""
+    """Calls without a name (raw indirect calls) are skipped."""
     data = [
         {
             "name": "sym.main",
-            "callrefs": [
-                {"type": "CALL", "name": ""},
-                {"type": "CALL"},  # missing name
-                {"type": "CALL", "name": "sym.imp.strcpy"},
+            "calls": [
+                {"name": ""},
+                {},  # missing name
+                {"name": "sym.imp.strcpy"},
             ],
         }
     ]

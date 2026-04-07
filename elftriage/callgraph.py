@@ -88,7 +88,7 @@ def build_call_graph(binary_path: str) -> Optional[CallGraph]:
         return None
 
     try:
-        pipe = r2pipe.open(binary_path, flags=["-2", "-q"])
+        pipe = r2pipe.open(binary_path)
     except Exception:
         return None
 
@@ -104,8 +104,16 @@ def build_call_graph(binary_path: str) -> Optional[CallGraph]:
     if not raw:
         return None
 
+    # r2pipe sometimes leaves prompt artifacts (":\n", control sequences,
+    # ANSI escapes) at the start of command output. Trim everything
+    # before the first JSON-array bracket.
+    bracket = raw.find("[")
+    if bracket == -1:
+        return None
+    json_text = raw[bracket:]
+
     try:
-        data = json.loads(raw)
+        data = json.loads(json_text)
     except json.JSONDecodeError:
         return None
 
@@ -155,10 +163,11 @@ def _parse_aflmj(data: Any) -> CallGraph:
     """Parse r2's ``aflmj`` output into a :class:`CallGraph`.
 
     ``aflmj`` emits a JSON array where each entry describes a function
-    and its outgoing calls via a ``callrefs`` list. Each callref has a
-    ``name`` field (when known) and a ``type`` of ``"CALL"`` for direct
-    calls. Entries without a ``name`` (raw addresses for unresolved
-    indirect calls) are skipped — they can't be tied to a callee name.
+    and its outgoing calls. Modern r2 emits the calls under the
+    ``calls`` key, with each item having a ``name`` field. The legacy
+    schema uses ``callrefs`` with a ``type`` of ``"CALL"`` — both are
+    accepted. Items without a ``name`` (raw addresses for unresolved
+    indirect calls) are skipped.
 
     Args:
         data: Parsed JSON from the ``aflmj`` command.
@@ -180,10 +189,17 @@ def _parse_aflmj(data: Any) -> CallGraph:
 
         callees: set[str] = graph.edges.setdefault(caller_name, set())
 
+        for ref in entry.get("calls", []) or []:
+            if not isinstance(ref, dict):
+                continue
+            callee_name = _normalize(ref.get("name", ""))
+            if callee_name:
+                callees.add(callee_name)
+
         for ref in entry.get("callrefs", []) or []:
             if not isinstance(ref, dict):
                 continue
-            if ref.get("type") != "CALL":
+            if ref.get("type") not in (None, "CALL"):
                 continue
             callee_name = _normalize(ref.get("name", ""))
             if callee_name:
@@ -205,16 +221,16 @@ def _parse_aflmj(data: Any) -> CallGraph:
 def _normalize(name: str) -> str:
     """Strip common r2 symbol prefixes so lookups work by bare name.
 
-    r2 emits names like ``sym.main``, ``sym.imp.strcpy``, ``fcn.00401130``.
-    We keep the final component for matching against :mod:`elftriage`'s
-    own function-boundary names, which are bare (``main``, ``strcpy``).
-    ``fcn.*`` stub names are returned as-is since they have no bare
-    equivalent.
+    r2 emits names like ``sym.main``, ``sym.imp.strcpy``,
+    ``dbg.vulnerable_function``, ``reloc.__libc_start_main``, or
+    ``fcn.00401130``. We keep the final component for matching against
+    :mod:`elftriage`'s own function-boundary names, which are bare
+    (``main``, ``strcpy``). ``fcn.*`` stub names are returned as-is
+    since they have no bare equivalent.
     """
     if not name:
         return ""
-    if name.startswith("sym.imp."):
-        return name[len("sym.imp.") :]
-    if name.startswith("sym."):
-        return name[len("sym.") :]
+    for prefix in ("sym.imp.", "sym.", "dbg.", "reloc.", "imp."):
+        if name.startswith(prefix):
+            return name[len(prefix) :]
     return name
