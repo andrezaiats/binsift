@@ -189,11 +189,12 @@ Report Generator ── text or JSON
 
 ## Exploitability Conditions
 
-Each finding is assessed against 10 boolean conditions. Each condition is tagged with a confidence level indicating whether the tool confirmed it from the binary, inferred it heuristically, or could not determine it.
+Each finding is assessed against a checklist of boolean conditions. Each condition is tagged with a confidence level and, when applicable, a list of structured caveats explaining the limits of that confidence.
 
 | Condition | Weight | Meaning |
 |-----------|--------|---------|
 | `critical_function` | +10 | Function is in the critical tier (always dangerous) |
+| `copy_size_exceeds_buffer` | +9 | Constant copy length is larger than the destination slot's upper-bound size |
 | `no_canary` | +8 | Stack canary is absent |
 | `format_string_controlled` | +8 | Format argument is not a string literal |
 | `no_nx` | +7 | NX disabled (stack is executable) |
@@ -207,9 +208,15 @@ Each finding is assessed against 10 boolean conditions. Each condition is tagged
 The severity score is the sum of weights for all satisfied conditions, clamped to a minimum of 0.
 
 **Confidence levels:**
-- **CONFIRMED** — the tool verified this directly from binary data (e.g., canary detected by checking for `__stack_chk_fail` in `.dynsym`)
-- **INFERRED** — the tool inferred this from heuristics (e.g., stack destination detected via backward slicing, which may miss register aliasing)
-- **UNKNOWN** — the tool could not determine this condition (e.g., destination could not be traced within the slice window)
+- **CONFIRMED** — the tool verified this directly from structural binary data: ELF headers, dynamic symbol tables, or section flags. Examples: protections (NX/PIE/canary/RELRO/FORTIFY), function category (critical/warning/mitigated), call-site density.
+- **INFERRED** — the tool derived this from a heuristic that has known blind spots. Conditions like `dest_is_stack` and `source_is_input` come from a 15-instruction backward slice that does not model register aliasing or pointer escaping. `copy_size_exceeds_buffer` compares against a slot size that is itself an upper bound (the distance to the next slot, not the buffer's true size).
+- **UNKNOWN** — the tool could not determine the condition from the available evidence. This is **not** a soft "false" — it explicitly means the analysis declined to commit.
+
+Conditions that are `INFERRED` carry a `caveats` list explaining *why* the evidence is partial. Examples: `"derived from windowed slice"`, `"aliasing not modeled"`, `"slot size is upper bound (distance to next slot)"`. Caveats appear inline in the text report and as a `caveats` array in JSON output.
+
+### Capability Warnings
+
+When optional analysis backends are unavailable (e.g. call-graph or IR-based taint engines added in later phases), the report opens with a `Capability Warnings` section listing what could not run. This makes it impossible for two environments to silently produce materially different reports for the same binary.
 
 ## Exploit Primitives
 

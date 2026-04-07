@@ -1,13 +1,19 @@
 """Tests for heuristic risk classifier."""
 
 from elftriage.classifier import classify_findings
+from elftriage.stackframe import StackFrameLayout, StackSlot
 from elftriage.types import (
     ArgSource,
     ArgumentInfo,
     CallSite,
+    ConditionConfidence,
     DangerousImport,
     ProtectionInfo,
 )
+
+
+def _conditions_by_name(finding: object) -> dict[str, object]:
+    return {c.name: c for c in finding.exploit_conditions}  # type: ignore[attr-defined]
 
 
 def test_critical_ranked_above_warning() -> None:
@@ -128,3 +134,126 @@ def test_empty_imports() -> None:
     """No imports should return no findings."""
     findings = classify_findings([], [], ProtectionInfo())
     assert findings == []
+
+
+def test_dest_is_stack_is_inferred_with_caveats() -> None:
+    """A slice-detected stack destination must be INFERRED + carry caveats."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+    )
+
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["dest_is_stack"]
+    assert cond.satisfied is True  # type: ignore[attr-defined]
+    confidence = cond.confidence  # type: ignore[attr-defined]
+    assert confidence == ConditionConfidence.INFERRED
+    caveats = cond.caveats  # type: ignore[attr-defined]
+    assert caveats, "dest_is_stack must carry caveats when INFERRED"
+    assert "aliasing not modeled" in caveats
+
+
+def test_source_is_input_is_inferred_with_caveats() -> None:
+    """A slice-detected input source must be INFERRED + carry caveats."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        arguments=[
+            ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40"),
+            ArgumentInfo("rsi", ArgSource.INPUT, "return value of read"),
+        ],
+    )
+
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["source_is_input"]
+    assert cond.satisfied is True  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.INFERRED  # type: ignore[attr-defined]
+    assert cond.caveats  # type: ignore[attr-defined]
+
+
+def test_protection_conditions_remain_confirmed() -> None:
+    """no_canary, no_pie, no_nx, no_relro stay CONFIRMED — they read header data."""
+    imports = [DangerousImport("strcpy", "critical", "Overflow", 0x1000)]
+    protections = ProtectionInfo(nx=False, canary=False, pie=False, relro="none")
+
+    findings = classify_findings(imports, [], protections)
+    conds = _conditions_by_name(findings[0])
+    for name in ("no_canary", "no_pie", "no_nx", "no_relro", "critical_function"):
+        actual = conds[name].confidence  # type: ignore[attr-defined]
+        assert actual == ConditionConfidence.CONFIRMED, name
+
+
+def test_copy_size_exceeds_buffer_satisfied() -> None:
+    """copy_size > slot.size_estimate must produce a satisfied INFERRED condition."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x100,
+    )
+    layout = StackFrameLayout(
+        function_name="vuln",
+        function_start=0x4000,
+        frame_base="rbp",
+        slots=[
+            StackSlot(offset=-0x40, size_estimate=0x40),
+            StackSlot(offset=-0x00, size_estimate=0),
+        ],
+        has_frame_pointer=True,
+        confidence="high",
+    )
+
+    findings = classify_findings(imports, [site], protections, {"vuln": layout})
+    cond = _conditions_by_name(findings[0])["copy_size_exceeds_buffer"]
+    assert cond.satisfied is True  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.INFERRED  # type: ignore[attr-defined]
+    assert any("upper bound" in c for c in cond.caveats)  # type: ignore[attr-defined]
+
+
+def test_copy_size_exceeds_buffer_unknown_when_no_size() -> None:
+    """No copy_size means the condition is UNKNOWN, not falsely satisfied."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=None,
+    )
+    findings = classify_findings(imports, [site], protections)
+    cond = _conditions_by_name(findings[0])["copy_size_exceeds_buffer"]
+    assert cond.satisfied is False  # type: ignore[attr-defined]
+    assert cond.confidence == ConditionConfidence.UNKNOWN  # type: ignore[attr-defined]
+
+
+def test_copy_size_within_buffer_does_not_fire() -> None:
+    """copy_size <= slot size must NOT mark the condition satisfied."""
+    imports = [DangerousImport("memcpy", "warning", "Dangerous", 0x1000)]
+    protections = ProtectionInfo(nx=True, canary=True, pie=True, relro="full")
+    site = CallSite(
+        0x5000,
+        "memcpy",
+        containing_function="vuln",
+        arguments=[ArgumentInfo("rdi", ArgSource.STACK, "rbp-0x40")],
+        copy_size=0x20,
+    )
+    layout = StackFrameLayout(
+        function_name="vuln",
+        function_start=0x4000,
+        frame_base="rbp",
+        slots=[StackSlot(offset=-0x40, size_estimate=0x40)],
+        has_frame_pointer=True,
+        confidence="high",
+    )
+    findings = classify_findings(imports, [site], protections, {"vuln": layout})
+    cond = _conditions_by_name(findings[0])["copy_size_exceeds_buffer"]
+    assert cond.satisfied is False  # type: ignore[attr-defined]

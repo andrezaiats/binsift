@@ -12,7 +12,11 @@ primitive into actionable exploit scenarios.
 
 from __future__ import annotations
 
-from elftriage.stackframe import StackFrameLayout, estimate_distance_to_return_address
+from elftriage.stackframe import (
+    StackFrameLayout,
+    estimate_distance_to_return_address,
+    get_slot_for_offset,
+)
 from elftriage.types import (
     ArgSource,
     CallSite,
@@ -29,6 +33,7 @@ from elftriage.types import (
 _CONDITION_WEIGHTS: dict[str, float] = {
     "critical_function": 10,
     "no_canary": 8,
+    "copy_size_exceeds_buffer": 9,
     "no_nx": 7,
     "dest_is_stack": 7,
     "source_is_input": 6,
@@ -94,12 +99,13 @@ def classify_findings(
     for imp in imports:
         func_sites = sites_by_func.get(imp.name, [])
 
-        conditions = _build_conditions(imp, func_sites, protections)
+        # Look up stack frame layout for both conditions and notes.
+        layout = _find_layout_for_sites(func_sites, stack_layouts)
+
+        conditions = _build_conditions(imp, func_sites, protections, layout)
         score = _compute_severity_score(conditions)
         primitive = _determine_primitive(conditions, imp.category)
 
-        # Look up stack frame layout for exploitability notes
-        layout = _find_layout_for_sites(func_sites, stack_layouts)
         notes = _generate_exploitability_notes(imp, func_sites, protections, layout)
 
         findings.append(
@@ -180,24 +186,36 @@ def build_exploit_scenarios(
 # ---------------------------------------------------------------------------
 
 
+_SLICE_CAVEATS = ["derived from windowed slice", "aliasing not modeled"]
+
+
 def _build_conditions(
     imp: DangerousImport,
     call_sites: list[CallSite],
     protections: ProtectionInfo,
+    stack_layout: StackFrameLayout | None = None,
 ) -> list[ExploitCondition]:
     """Build the full list of exploit conditions for a single finding.
+
+    Conditions whose evidence is structural (read directly from the ELF
+    header or symbol tables) are tagged ``CONFIRMED``. Conditions
+    derived from the windowed backward slice in :mod:`arganalysis` or
+    from the heuristic stack-frame reconstruction are tagged
+    ``INFERRED`` and carry explicit caveats.
 
     Args:
         imp: The dangerous import being assessed.
         call_sites: Call sites for this import.
         protections: Binary protection flags.
+        stack_layout: Stack frame layout of the containing function, if
+            one was reconstructed.
 
     Returns:
         List of ``ExploitCondition`` objects.
     """
     conditions: list[ExploitCondition] = []
 
-    # Protection-based conditions
+    # Protection-based conditions — always CONFIRMED.
     conditions.append(
         ExploitCondition(
             name="no_canary",
@@ -239,7 +257,7 @@ def _build_conditions(
         )
     )
 
-    # Argument-based conditions
+    # Argument-based conditions — INFERRED, derived from the slice.
     has_stack_dest = any(
         arg.register == "rdi" and arg.source == ArgSource.STACK
         for site in call_sites
@@ -250,7 +268,7 @@ def _build_conditions(
             name="dest_is_stack",
             satisfied=has_stack_dest,
             confidence=(
-                ConditionConfidence.CONFIRMED
+                ConditionConfidence.INFERRED
                 if has_stack_dest
                 else ConditionConfidence.UNKNOWN
             ),
@@ -259,6 +277,7 @@ def _build_conditions(
                 if has_stack_dest
                 else "Destination target unknown"
             ),
+            caveats=list(_SLICE_CAVEATS) if has_stack_dest else [],
         )
     )
 
@@ -269,31 +288,50 @@ def _build_conditions(
         ExploitCondition(
             name="source_is_input",
             satisfied=has_input_src,
-            confidence=ConditionConfidence.CONFIRMED,
+            confidence=(
+                ConditionConfidence.INFERRED
+                if has_input_src
+                else ConditionConfidence.UNKNOWN
+            ),
             detail=(
                 "An argument originates from an input source"
                 if has_input_src
                 else "No input-sourced arguments detected"
             ),
+            caveats=list(_SLICE_CAVEATS) if has_input_src else [],
         )
     )
 
-    # Format string condition
+    # Format string condition — INFERRED when source provenance is unclear.
     has_fmt_risk = any(site.is_format_string_risk for site in call_sites)
+    fmt_unresolved = any(_fmt_arg_unresolved(site, imp.name) for site in call_sites)
+    if has_fmt_risk and fmt_unresolved:
+        fmt_confidence = ConditionConfidence.INFERRED
+        fmt_caveats = ["format arg source not fully resolved"]
+    elif has_fmt_risk:
+        fmt_confidence = ConditionConfidence.INFERRED
+        fmt_caveats = list(_SLICE_CAVEATS)
+    else:
+        fmt_confidence = ConditionConfidence.UNKNOWN
+        fmt_caveats = []
     conditions.append(
         ExploitCondition(
             name="format_string_controlled",
             satisfied=has_fmt_risk,
-            confidence=ConditionConfidence.CONFIRMED,
+            confidence=fmt_confidence,
             detail=(
                 "Format argument is not a string literal"
                 if has_fmt_risk
                 else "No format string risk detected"
             ),
+            caveats=fmt_caveats,
         )
     )
 
-    # Category-based conditions
+    # New: copy_size_exceeds_buffer — the most honest overflow signal.
+    conditions.append(_build_copy_size_condition(call_sites, stack_layout))
+
+    # Category-based conditions — CONFIRMED, derived from symbol tables.
     conditions.append(
         ExploitCondition(
             name="fortified",
@@ -319,7 +357,7 @@ def _build_conditions(
         )
     )
 
-    # Call site density
+    # Call site density — CONFIRMED.
     conditions.append(
         ExploitCondition(
             name="multiple_call_sites",
@@ -334,6 +372,81 @@ def _build_conditions(
     )
 
     return conditions
+
+
+def _fmt_arg_unresolved(site: CallSite, func_name: str) -> bool:
+    """Return True if a site's format argument source could not be resolved.
+
+    Looks up the format-arg index for the function and checks whether
+    that argument's source classification was a register pass-through or
+    an unknown value — both of which mean the slice could not pin down
+    where the format string came from.
+    """
+    from elftriage import dangerous_functions
+
+    fmt_idx = dangerous_functions.get_format_arg_index(func_name)
+    if fmt_idx is None or fmt_idx >= len(site.arguments):
+        return False
+    fmt_arg = site.arguments[fmt_idx]
+    return fmt_arg.source in (ArgSource.REGISTER, ArgSource.UNKNOWN)
+
+
+def _build_copy_size_condition(
+    call_sites: list[CallSite],
+    layout: StackFrameLayout | None,
+) -> ExploitCondition:
+    """Build the ``copy_size_exceeds_buffer`` condition.
+
+    For each call site with a constant ``copy_size`` and a stack
+    destination whose containing slot we can locate, compare the copy
+    length against the slot's ``size_estimate``. The slot size is the
+    distance to the next slot — an upper bound on the buffer's true
+    size, not the size itself — so the result is always ``INFERRED``
+    with an explicit caveat. ``UNKNOWN`` is used when no comparison can
+    be made (no copy_size, no stack dest, or no slot lookup).
+    """
+    for site in call_sites:
+        if site.copy_size is None:
+            continue
+        slot_offset, _detail = _stack_dest_offset(site)
+        if slot_offset is None:
+            continue
+        if layout is None:
+            continue
+        slot = get_slot_for_offset(layout, slot_offset)
+        if slot is None or slot.size_estimate <= 0:
+            continue
+        if site.copy_size > slot.size_estimate:
+            return ExploitCondition(
+                name="copy_size_exceeds_buffer",
+                satisfied=True,
+                confidence=ConditionConfidence.INFERRED,
+                detail=(
+                    f"copy length {site.copy_size} > slot size "
+                    f"≤{slot.size_estimate} at {slot.offset:+d}"
+                ),
+                caveats=[
+                    "slot size is upper bound (distance to next slot)",
+                    "padding and slot reuse not modeled",
+                ],
+            )
+
+    return ExploitCondition(
+        name="copy_size_exceeds_buffer",
+        satisfied=False,
+        confidence=ConditionConfidence.UNKNOWN,
+        detail="No constant copy length and stack destination both visible",
+    )
+
+
+def _stack_dest_offset(site: CallSite) -> tuple[int | None, str]:
+    """Pull a stack offset out of an rdi STACK argument's detail string."""
+    for arg in site.arguments:
+        if arg.register == "rdi" and arg.source == ArgSource.STACK:
+            offset = _parse_stack_offset(arg.detail)
+            if offset is not None:
+                return offset, arg.detail
+    return None, ""
 
 
 # ---------------------------------------------------------------------------
@@ -433,46 +546,6 @@ def _find_layout_for_sites(
     for site in call_sites:
         if site.containing_function in stack_layouts:
             return stack_layouts[site.containing_function]
-    return None
-
-
-def _find_distance_to_return(
-    call_sites: list[CallSite],
-    stack_layouts: dict[str, StackFrameLayout] | None,
-) -> int | None:
-    """Estimate the distance from a stack buffer to the return address.
-
-    Searches call sites for one whose destination argument (rdi) points
-    to a stack buffer.  If a matching stack frame layout is available,
-    uses it to compute the distance.
-
-    Args:
-        call_sites: Call sites for the import.
-        stack_layouts: Mapping of function name to layout.
-
-    Returns:
-        Distance in bytes, or ``None`` if not determinable.
-    """
-    if not stack_layouts:
-        return None
-
-    from elftriage.stackframe import get_slot_for_offset
-
-    for site in call_sites:
-        if site.containing_function not in stack_layouts:
-            continue
-        layout = stack_layouts[site.containing_function]
-
-        for arg in site.arguments:
-            if arg.register == "rdi" and arg.source == ArgSource.STACK:
-                # Try to parse the offset from the detail string
-                offset = _parse_stack_offset(arg.detail)
-                if offset is not None:
-                    slot = get_slot_for_offset(layout, offset)
-                    if slot is not None:
-                        dist = estimate_distance_to_return_address(layout, slot)
-                        if dist is not None:
-                            return dist
     return None
 
 
@@ -588,13 +661,14 @@ def _generate_exploitability_notes(
             "or write arbitrary memory via %n"
         )
 
-    # Stack frame distance note
+    # Stack frame distance note — always an upper bound.
     if stack_layout is not None and has_stack_dest:
         distance = _compute_distance_from_layout(call_sites, stack_layout)
         if distance is not None:
             notes.append(
-                f"Buffer is {distance} bytes from return address "
-                "(confirmed via stack frame analysis)"
+                f"Buffer is \u2264{distance} bytes from return address "
+                "(upper bound from stack layout — padding and slot reuse "
+                "not modeled)"
             )
 
     # Cross-reference notes
@@ -617,17 +691,12 @@ def _compute_distance_from_layout(
     call_sites: list[CallSite],
     layout: StackFrameLayout,
 ) -> int | None:
-    """Compute distance to return address using a stack frame layout.
+    """Compute an upper-bound distance from a stack buffer to the return address.
 
-    Args:
-        call_sites: Call sites to search for stack-dest arguments.
-        layout: The stack frame layout of the containing function.
-
-    Returns:
-        Distance in bytes, or ``None``.
+    The returned value is an upper bound — the buffer is at most this
+    many bytes from the saved return address. The slot reconstruction
+    cannot prove an exact value without type recovery.
     """
-    from elftriage.stackframe import get_slot_for_offset
-
     for site in call_sites:
         for arg in site.arguments:
             if arg.register == "rdi" and arg.source == ArgSource.STACK:

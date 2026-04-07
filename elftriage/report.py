@@ -32,6 +32,16 @@ def generate_text_report(result: AnalysisResult) -> str:
     lines.append(f"Binary: {result.binary_path}")
     lines.append("")
 
+    # Capability warnings — visible at the top so two environments
+    # producing different reports are immediately distinguishable.
+    if result.capability_warnings:
+        lines.append("-" * 40)
+        lines.append("Capability Warnings")
+        lines.append("-" * 40)
+        for warning in result.capability_warnings:
+            lines.append(f"  ! {warning}")
+        lines.append("")
+
     # Protections section
     lines.append("-" * 40)
     lines.append("Binary Protections")
@@ -162,8 +172,13 @@ def _format_condition(cond: ExploitCondition, indent: int = 4) -> list[str]:
     prefix = " " * indent
     confidence_tag = f"[{cond.confidence.value.upper()}]"
     symbol = "\u2713" if cond.satisfied else "\u2717"
-    detail_str = f" ({cond.detail})" if cond.detail else ""
-    return [f"{prefix}{confidence_tag:12s} {symbol} {cond.name}{detail_str}"]
+    parts: list[str] = []
+    if cond.detail:
+        parts.append(cond.detail)
+    if cond.caveats:
+        parts.append("caveats: " + ", ".join(cond.caveats))
+    suffix = f" ({'; '.join(parts)})" if parts else ""
+    return [f"{prefix}{confidence_tag:12s} {symbol} {cond.name}{suffix}"]
 
 
 def _format_scenarios(scenarios: list[ExploitScenario]) -> list[str]:
@@ -247,6 +262,8 @@ def _condition_to_dict(cond: ExploitCondition) -> dict[str, Any]:
     }
     if cond.detail:
         data["detail"] = cond.detail
+    if cond.caveats:
+        data["caveats"] = list(cond.caveats)
     return data
 
 
@@ -285,6 +302,8 @@ def _result_to_dict(result: AnalysisResult) -> dict[str, Any]:
         "findings": [_finding_to_dict(f) for f in result.findings],
         "summary": result.summary_stats,
     }
+    if result.capability_warnings:
+        data["capability_warnings"] = list(result.capability_warnings)
     if result.functions:
         data["functions_detected"] = len(result.functions)
     if result.exploit_scenarios:
@@ -335,6 +354,8 @@ def _call_site_to_dict(site: CallSite) -> dict[str, Any]:
         data["arguments"] = [_arg_to_dict(arg) for arg in site.arguments]
     if site.is_format_string_risk:
         data["format_string_risk"] = True
+    if site.copy_size is not None:
+        data["copy_size"] = site.copy_size
     return data
 
 

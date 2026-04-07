@@ -27,6 +27,26 @@ _INPUT_FUNCTIONS = {"read", "recv", "recvfrom", "fgets", "fread", "getline"}
 # Max instructions to scan backwards from the call site
 _SLICE_DEPTH = 15
 
+# Functions whose copy/read length argument is in rdx (3rd arg).
+_RDX_SIZE_FUNCTIONS = {
+    "memcpy",
+    "memmove",
+    "memset",
+    "strncpy",
+    "strncat",
+    "snprintf",
+    "strlcpy",
+    "strlcat",
+    "read",
+    "recv",
+}
+
+# Functions whose copy/read length argument is in rsi (2nd arg).
+# fgets has signature (buf, size, FILE*); gets has none.
+_RSI_SIZE_FUNCTIONS = {
+    "fgets",
+}
+
 
 def analyze_call_arguments(
     elffile: ELFFile,
@@ -83,6 +103,9 @@ def analyze_call_arguments(
 
         site.arguments = arguments
 
+        # Extract a constant copy/length size if the slice contains one.
+        site.copy_size = _extract_copy_size(pre_insns, site.function_name)
+
         # Check format string risk
         fmt_idx = dangerous_functions.get_format_arg_index(site.function_name)
         if fmt_idx is not None and fmt_idx < len(arguments):
@@ -91,6 +114,140 @@ def analyze_call_arguments(
                 site.is_format_string_risk = True
 
     return call_sites
+
+
+def _extract_copy_size(
+    instructions: list[object],
+    func_name: str,
+) -> int | None:
+    """Try to recover a constant copy/length argument from the slice.
+
+    For functions like ``memcpy``/``read``/``snprintf`` the length is in
+    ``rdx``; for ``fgets`` the size is in ``rsi``. We look at the most
+    recent write to that register and only return a value if it's an
+    immediate ``mov``. Anything else (register-to-register, memory load,
+    call result) is conservatively treated as unknown.
+
+    Args:
+        instructions: Pre-call instructions for this site.
+        func_name: The dangerous function name.
+
+    Returns:
+        The constant size in bytes, or ``None`` if not derivable.
+    """
+    if func_name in _RDX_SIZE_FUNCTIONS:
+        size_reg = "rdx"
+    elif func_name in _RSI_SIZE_FUNCTIONS:
+        size_reg = "rsi"
+    else:
+        return None
+
+    target_variants = _register_variants(size_reg)
+
+    for insn in reversed(instructions):
+        mnemonic: str = insn.mnemonic  # type: ignore[attr-defined]
+        op_str: str = insn.op_str  # type: ignore[attr-defined]
+
+        parts = [p.strip() for p in op_str.split(",")]
+        if len(parts) < 2:
+            continue
+
+        dest = parts[0].lower()
+        if dest not in target_variants:
+            continue
+
+        # Only an immediate mov gives us a confidently constant size.
+        if mnemonic != "mov":
+            return None
+
+        src = parts[1].strip().lower()
+        # Reject memory operands and rip-relative loads.
+        if "[" in src or "rip" in src:
+            return None
+        # Reject register-to-register copies.
+        if src in _REGISTER_NAMES:
+            return None
+
+        try:
+            value = int(src, 0)
+        except ValueError:
+            return None
+
+        return value if value >= 0 else None
+
+    return None
+
+
+_REGISTER_NAMES: set[str] = {
+    "rax",
+    "rbx",
+    "rcx",
+    "rdx",
+    "rsi",
+    "rdi",
+    "rsp",
+    "rbp",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "eax",
+    "ebx",
+    "ecx",
+    "edx",
+    "esi",
+    "edi",
+    "esp",
+    "ebp",
+    "r8d",
+    "r9d",
+    "r10d",
+    "r11d",
+    "r12d",
+    "r13d",
+    "r14d",
+    "r15d",
+    "ax",
+    "bx",
+    "cx",
+    "dx",
+    "si",
+    "di",
+    "sp",
+    "bp",
+    "al",
+    "bl",
+    "cl",
+    "dl",
+    "ah",
+    "bh",
+    "ch",
+    "dh",
+    "sil",
+    "dil",
+    "spl",
+    "bpl",
+    "r8w",
+    "r9w",
+    "r10w",
+    "r11w",
+    "r12w",
+    "r13w",
+    "r14w",
+    "r15w",
+    "r8b",
+    "r9b",
+    "r10b",
+    "r11b",
+    "r12b",
+    "r13b",
+    "r14b",
+    "r15b",
+}
 
 
 def _trace_register(

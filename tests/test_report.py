@@ -7,9 +7,11 @@ from elftriage.types import (
     AnalysisResult,
     ArgSource,
     ArgumentInfo,
+    ConditionConfidence,
     DangerousImport,
     DisassemblyLine,
     CallSite,
+    ExploitCondition,
     Finding,
     ProtectionInfo,
 )
@@ -161,3 +163,68 @@ def test_empty_findings_report() -> None:
     assert "No dangerous function imports detected" in text
     data = json.loads(generate_json_report(result))
     assert data["findings"] == []
+
+
+def test_text_report_renders_caveats_inline() -> None:
+    """Conditions with caveats render them inline in the text report."""
+    cond = ExploitCondition(
+        name="dest_is_stack",
+        satisfied=True,
+        confidence=ConditionConfidence.INFERRED,
+        detail="Destination points to a stack buffer",
+        caveats=["aliasing not modeled", "derived from windowed slice"],
+    )
+    result = _sample_result()
+    result.findings[0].exploit_conditions = [cond]
+    report = generate_text_report(result)
+    assert "INFERRED" in report
+    assert "aliasing not modeled" in report
+    assert "derived from windowed slice" in report
+
+
+def test_text_report_capability_warnings_section() -> None:
+    """capability_warnings appear at the top of the text report."""
+    result = _sample_result()
+    result.capability_warnings = [
+        "Reachability analysis unavailable: install with 'pip install -e .[callgraph]'",
+    ]
+    report = generate_text_report(result)
+    assert "Capability Warnings" in report
+    assert "Reachability analysis unavailable" in report
+
+
+def test_json_report_capability_warnings_field() -> None:
+    """capability_warnings round-trip through JSON output."""
+    result = _sample_result()
+    result.capability_warnings = ["IR-based taint analysis unavailable"]
+    data = json.loads(generate_json_report(result))
+    assert data["capability_warnings"] == ["IR-based taint analysis unavailable"]
+
+
+def test_json_report_caveats_round_trip() -> None:
+    """Caveats round-trip through JSON output."""
+    cond = ExploitCondition(
+        name="copy_size_exceeds_buffer",
+        satisfied=True,
+        confidence=ConditionConfidence.INFERRED,
+        detail="copy length 256 > slot size ≤64 at -64",
+        caveats=["slot size is upper bound (distance to next slot)"],
+    )
+    result = _sample_result()
+    result.findings[0].exploit_conditions = [cond]
+    data = json.loads(generate_json_report(result))
+    finding = data["findings"][0]
+    assert "exploit_conditions" in finding
+    json_cond = finding["exploit_conditions"][0]
+    assert json_cond["caveats"] == [
+        "slot size is upper bound (distance to next slot)",
+    ]
+
+
+def test_json_report_call_site_copy_size() -> None:
+    """copy_size on a CallSite round-trips through JSON output."""
+    result = _sample_result()
+    result.findings[0].call_sites[0].copy_size = 0x100
+    data = json.loads(generate_json_report(result))
+    site = data["findings"][0]["call_sites"][0]
+    assert site["copy_size"] == 0x100

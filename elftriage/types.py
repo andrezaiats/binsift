@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Optional
 
 
 class ConditionConfidence(Enum):
@@ -85,16 +86,25 @@ class CallSite:
     disassembly_lines: list[DisassemblyLine] = field(default_factory=list)
     arguments: list[ArgumentInfo] = field(default_factory=list)
     is_format_string_risk: bool = False
+    copy_size: Optional[int] = None
 
 
 @dataclass
 class ExploitCondition:
-    """A single condition relevant to exploitability assessment."""
+    """A single condition relevant to exploitability assessment.
+
+    Caveats are short structured strings explaining the limits of the
+    confidence assessment (e.g. ``"upper bound only"``,
+    ``"aliasing not modeled"``, ``"derived from windowed slice"``). They
+    let the report carry nuance without overloading the confidence enum
+    with extra levels.
+    """
 
     name: str
     satisfied: bool
     confidence: ConditionConfidence
     detail: str = ""
+    caveats: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -131,7 +141,14 @@ class FunctionBoundary:
 
 @dataclass
 class AnalysisResult:
-    """Complete analysis result for a binary."""
+    """Complete analysis result for a binary.
+
+    ``capability_warnings`` collects messages about optional analysis
+    features that are unavailable in the current environment (e.g.
+    missing call-graph backend or IR taint engine). They are surfaced in
+    the report so that two environments analysing the same binary cannot
+    silently produce materially different conclusions.
+    """
 
     binary_path: str
     protections: ProtectionInfo = field(default_factory=ProtectionInfo)
@@ -139,3 +156,4 @@ class AnalysisResult:
     functions: list[FunctionBoundary] = field(default_factory=list)
     summary_stats: dict[str, int] = field(default_factory=dict)
     exploit_scenarios: list[ExploitScenario] = field(default_factory=list)
+    capability_warnings: list[str] = field(default_factory=list)
